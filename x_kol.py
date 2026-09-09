@@ -117,7 +117,7 @@ def fetch_kolscan() -> list[str]:
             if h:
                 out.append(h)
         if not out:
-            alert_scrape("KolScan", "page loaded but no twitter/x.com handles found")
+            log.warning("kolscan page loaded but no twitter/x.com handles found")
     # unique, keep order
     seen = set()
     uniq = []
@@ -178,9 +178,6 @@ def fetch_mwx() -> list[str]:
     if last_err:
         alert_scrape("MWX / @mwx_ai", last_err)
         return []
-    if not text.strip():
-        alert_scrape("MWX / @mwx_ai", "x_search returned empty text")
-        return []
     out = []
     for line in text.splitlines():
         for raw in AT_RE.findall(line) + [line.strip()]:
@@ -194,8 +191,9 @@ def fetch_mwx() -> list[str]:
             seen.add(h)
             uniq.append(h)
     if not uniq:
-        alert_scrape("MWX / @mwx_ai", "response had no @handles to parse")
-    log.info("mwx handles=%s", len(uniq))
+        log.info("mwx returned no handles (not an outage)")
+    else:
+        log.info("mwx handles=%s", len(uniq))
     return uniq
 
 
@@ -319,15 +317,54 @@ def parse_hits(text: str) -> list[dict]:
     return hits
 
 
+def dex_ticker(token: str) -> str | None:
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token}",
+            timeout=8,
+        )
+        pairs = (r.json() or {}).get("pairs") or []
+        if not pairs:
+            return None
+        pairs.sort(
+            key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+            reverse=True,
+        )
+        return (pairs[0].get("baseToken") or {}).get("symbol")
+    except Exception:
+        return None
+
+
+def clean_quote(line: str, ca: str) -> str:
+    text = line
+    text = re.sub(r"CA\s*=\s*\S+", "", text, flags=re.I)
+    text = re.sub(r"followers\s*=\s*\S+", "", text, flags=re.I)
+    text = re.sub(r"ticker\s*=\s*\S+", "", text, flags=re.I)
+    text = re.sub(r"quote\s*=\s*", "", text, flags=re.I)
+    text = re.sub(r"\|", " ", text)
+    text = text.replace(ca, "").strip(" -|")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or text.lower() in {ca.lower(), "?"}:
+        return ""
+    return text[:280]
+
+
 def axiom_url(token: str) -> str:
     slug = "robinhood" if token.startswith("0x") else "sol"
     return f"https://axiom.trade/meme/{token}?chain={slug}"
 
 
 def post(hit: dict):
-    ticker = hit["ticker"]
-    title = f"KOL CA — ${ticker}" if ticker != "?" else "KOL CA"
+    ticker = hit.get("ticker") if hit.get("ticker") not in {None, "?", ""} else None
+    ticker = ticker or dex_ticker(hit["ca"])
+    title = f"KOL CA — ${ticker}" if ticker else "KOL CA"
     buy = axiom_url(hit["ca"])
+    fol = hit.get("followers")
+    who = f"**@{hit['handle']}**"
+    if fol and fol not in {"?", ""}:
+        who += f" · {fol} followers"
+    quote = clean_quote(hit.get("line") or "", hit["ca"])
+    desc = who if not quote else f"{who}\n{quote}"
     requests.post(
         KOL_WEBHOOK,
         json={
@@ -335,10 +372,7 @@ def post(hit: dict):
                 {
                     "title": title,
                     "url": buy,
-                    "description": (
-                        f"**@{hit['handle']}** · {hit['followers']} followers\n"
-                        f"{hit['line']}"
-                    )[:1900],
+                    "description": desc[:1900],
                     "color": 0x1DA1F2,
                     "fields": [
                         {"name": "CA", "value": f"`{hit['ca']}`", "inline": False},
